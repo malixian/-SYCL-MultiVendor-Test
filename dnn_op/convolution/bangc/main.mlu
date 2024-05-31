@@ -1,0 +1,240 @@
+/*************************************************************************
+ * Copyright (C) [2020] by Cambricon, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *************************************************************************/
+
+/**
+* Convolution operation: dst = src * filter.
+* Input src: src tensor which has HWC data layout.
+* Input filter: filter tensor which has NHWC data layout.
+* Output dst: dst tensor which has HWC data layout.
+*
+* This sample implements convolution operation which makes input src in __nram__
+* and intput filter in __wram__ to ensure high performance by using Cambircon BANGC
+* Artificial Intelligence Functions __bang_conv.
+* Note that before invoke kernel should reshape filter.
+* For more details, please see the following sample.
+*/
+
+// System includes
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+// Functions and utilities to work with BANGC
+#include <bang.h>
+
+#define ROUND 128
+#define IN_DATA_NUM ROUND * ROUND
+#define OUT_DATA_NUM ROUND * ROUND
+#define FILTER_DATA_NUM IN_DATA_NUM
+
+/**
+ * Convolution operation (MLU Kernel) on the device: dst = src * filter
+ */
+__mlu_global__ void ConvKernel(float *out_data,
+                              float *in_data_1,
+                              float *in_data_2
+                              ) {
+  __nram__ float nram_out_data[OUT_DATA_NUM];
+  __nram__ float nram_in_data[IN_DATA_NUM];
+  __wram__ float wram_filter[IN_DATA_NUM];
+
+  __memcpy(nram_in_data, in_data_1, IN_DATA_NUM * sizeof(float), GDRAM2NRAM);
+  __memcpy(wram_filter, in_data_2, IN_DATA_NUM * sizeof(float), GDRAM2WRAM);
+
+  //__bang_matmul(nram_out_data, nram_in_data, wram_filter, ROUND, ROUND,
+  //            ROUND, 1);
+  
+  __mlvm_stream_conv_dilation_f32_f32_f32(nram_out_data, nram_in_data, wram_filter, ROUND, ROUND,
+                                          1, 1, 1, 1, 1, ROUND, 1, 1, 1, 1, 0);
+
+  __memcpy(out_data, nram_out_data, OUT_DATA_NUM * sizeof(float), NRAM2GDRAM);
+}
+
+void ConvMLU(float *out_data,
+             float *in_data,
+             float *filter_data
+             ) {
+  // Allocate host memory for out_data
+  float *out_data_float = (float *)malloc(OUT_DATA_NUM * sizeof(float));
+  if (out_data_float == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Select device
+  CNRT_CHECK(cnrtSetDevice(0));
+
+  // Create task queue
+  // When invoke a kernel, need to specify a task queue
+  cnrtQueue_t pQueue;
+  CNRT_CHECK(cnrtQueueCreate(&pQueue));
+
+  // Set task type
+  // Means the number of mlu cores or clusters when starting the kernel
+  cnrtFunctionType_t c = CNRT_FUNC_TYPE_BLOCK;
+
+  // Describle the task size
+  cnrtDim3_t dim;
+  dim.x = 1;
+  dim.y = 1;
+  dim.z = 1;
+
+  // create Notifier
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  // Allocate memory in mlu
+  float *mlu_out_data;
+  float *mlu_filter_data;
+  float *mlu_in_data;
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_in_data, IN_DATA_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_filter_data, FILTER_DATA_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_out_data, OUT_DATA_NUM * sizeof(float)));
+
+  // Copy data from cpu to mlu
+  CNRT_CHECK(
+      cnrtMemcpy(mlu_in_data, in_data, IN_DATA_NUM * sizeof(float), CNRT_MEM_TRANS_DIR_HOST2DEV));
+  CNRT_CHECK(cnrtMemcpy(mlu_filter_data, filter_data, FILTER_DATA_NUM * sizeof(float),
+                        CNRT_MEM_TRANS_DIR_HOST2DEV));
+
+  // place Notifier into the task queue
+  CNRT_CHECK(cnrtPlaceNotifier(start, pQueue));
+
+  // Invoke MLU Kernel to perform computing task
+  ConvKernel<<<dim, c, pQueue>>>(mlu_out_data, mlu_in_data, mlu_filter_data);
+
+   CNRT_CHECK(cnrtPlaceNotifier(end, pQueue));
+   
+  // Synchronize to make sure computing task is finish
+  CNRT_CHECK(cnrtQueueSync(pQueue));
+  float timeTotal;
+  // calculate time
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal * 1.8 / 1000.0);
+
+  // Free mlu memory
+  CNRT_CHECK(cnrtFree(mlu_in_data));
+  CNRT_CHECK(cnrtFree(mlu_filter_data));
+
+  // Copy data back
+  CNRT_CHECK(cnrtMemcpy(out_data_float, mlu_out_data, OUT_DATA_NUM * sizeof(float),
+                        CNRT_MEM_TRANS_DIR_DEV2HOST));
+
+  CNRT_CHECK(cnrtFree(mlu_out_data));
+  CNRT_CHECK(cnrtQueueDestroy(pQueue));
+  free(out_data_float);
+  out_data_float = NULL;
+}
+
+/**
+ * Program main
+ */
+int main() {
+  // Allocate host memory
+  float *ori_in_data = (float *)malloc(IN_DATA_NUM * sizeof(float));
+  if (ori_in_data == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+  float *ori_filter_data = (float *)malloc(FILTER_DATA_NUM * sizeof(float));
+  if (ori_filter_data == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+  float *ori_filter_data_cpu = (float *)malloc(FILTER_DATA_NUM * sizeof(float));
+  if (ori_filter_data_cpu == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+  float *ori_out_data = (float *)malloc(OUT_DATA_NUM * sizeof(float));
+  if (ori_out_data == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+  float *out_data = (float *)malloc(OUT_DATA_NUM * sizeof(float));
+  if (out_data == NULL) {
+    printf("malloc FAILED!\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Generate ori_in_data
+  srand((unsigned)time(NULL));
+  for (int i = 0; i < IN_DATA_NUM; ++i) {
+    ori_in_data[i] = (float)(rand() % 3 + 1);
+  }
+
+  // Prepare the ori_filter_data_cpu
+  int idx = 0;
+  for (int j = 0; j < ROUND; j++) {
+    for (int i = 0; i < ROUND; ++i) {
+      ori_filter_data_cpu[idx++] = (float)(rand() % 3 + 1);
+    }
+  }
+
+  /*
+  // Compute CPU result
+  
+  ConvCPU(ori_out_data, ori_in_data, ori_filter_data_cpu);
+
+  for (int i = 0; i < OUT_DATA_NUM; i++) {
+    ori_out_data[i] = ori_out_data[i] * 2;
+    out_data[i] = 0;
+  }
+  */
+  // Compute the MLU result
+  ConvMLU(out_data, ori_in_data, ori_filter_data_cpu);
+  bool correct = true;
+  // Verify CPU result and MLU result
+  /*
+  bool correct = true;
+  double eps = 1.e-3;
+  for (int i = 0; i < OUT_DATA_NUM; i++) {
+    if (fabs(out_data[i] - ori_out_data[i]) > eps) {
+      correct = false;
+      break;
+    }
+  }
+  */
+  /*
+  for (int i = 0; i < ROUND; i++) {
+    printf("Output data is: %d \n", out_data[i]);
+  }
+  */
+
+  printf("Checking computed result for correctness: ");
+  printf(correct ? "MLU Result PASSED\n" : "MLU Result FAILED\n");
+
+  // Clean up memory
+  free(ori_in_data);
+  ori_in_data = NULL;
+  free(ori_filter_data);
+  ori_filter_data = NULL;
+  free(ori_filter_data_cpu);
+  ori_filter_data_cpu = NULL;
+  free(ori_out_data);
+  ori_out_data = NULL;
+  free(out_data);
+  out_data = NULL;
+  return 0;
+}

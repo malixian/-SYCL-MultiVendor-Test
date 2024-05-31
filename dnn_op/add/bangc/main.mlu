@@ -1,0 +1,128 @@
+/*************************************************************************
+ * Copyright (C) [2020] by Cambricon, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *************************************************************************/
+#include <bang.h>
+#include <chrono>
+
+#define EPS 1e-7
+#define LEN 1024
+#define REPEAT 100
+
+using namespace std;
+
+__mlu_entry__ void Kernel(float* dst, float* source1, float* source2) {
+  __nram__ float dest[LEN];
+  __nram__ float src1[LEN];
+  __nram__ float src2[LEN];
+  __memcpy(src1, source1, LEN * sizeof(float), GDRAM2NRAM);
+  __memcpy(src2, source2, LEN * sizeof(float), GDRAM2NRAM);
+  __bang_add(dest, src1, src2, LEN);
+  __memcpy(dst, dest, LEN * sizeof(float), NRAM2GDRAM);
+}
+
+int main(void)
+{
+  cnrtQueue_t queue;
+  // select device
+  CNRT_CHECK(cnrtSetDevice(0));
+  // create task queue
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  // set kernel's task size
+  cnrtDim3_t dim = {1, 1, 1};
+  // set kernel's task type
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  // create Notifier
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_dst = (float*)malloc(LEN * sizeof(float));
+  float* host_src1 = (float*)malloc(LEN * sizeof(float));
+  float* host_src2 = (float*)malloc(LEN * sizeof(float));
+
+  for (int i = 0; i < LEN; i++) {
+    host_src1[i] = i;
+    host_src2[i] = i;
+  }
+
+  float* mlu_dst;
+  float* mlu_src1;
+  float* mlu_src2;
+  
+  // allocate device memory
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, LEN * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src1, LEN * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src2, LEN * sizeof(float)));
+  
+  // copy host data to device memory
+  CNRT_CHECK(cnrtMemcpy(mlu_src1, host_src1, LEN * sizeof(float), cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtMemcpy(mlu_src2, host_src2, LEN * sizeof(float), cnrtMemcpyHostToDev));
+
+  // place Notifier into the task queue
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  // launch kernel and add it to task queue
+
+  //auto start_time = std::chrono::steady_clock::now();
+  Kernel<<<dim, ktype, queue>>>(mlu_dst, mlu_src1, mlu_src2);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+
+  // wait for the task queue to complete execution
+  cnrtQueueSync(queue);
+  
+  //auto end_time = std::chrono::steady_clock::now();
+  //auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+  //printf("Kernel execution time %f (ms)\n", time / REPEAT * 4 * 1e-6f);
+
+  // copy result to host side
+  CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, LEN * sizeof(float), cnrtMemcpyDevToHost));
+
+  bool passed = true;
+  for (int i = 0; i < LEN; i++) {
+    if (fabsf(host_dst[i] - 2 * i) > EPS) {
+      passed = false;
+      printf("%f expected, but %f got!\n", (float)(2 * i), host_dst[i]);
+    }
+  }
+
+  printf(passed ? "PASSED\n" : "FAILED\n");
+
+  float timeTotal;
+  // calculate time
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal * 4 / 1000.0);
+
+  // free task queue
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  // free device memory
+  cnrtFree(mlu_dst);
+  cnrtFree(mlu_src1);
+  cnrtFree(mlu_src2);
+  // free host memory
+  free(host_dst);
+  free(host_src1);
+  free(host_src2);
+
+  return 0;
+}
